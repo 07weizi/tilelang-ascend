@@ -198,3 +198,167 @@ def cpu_sparse_flash_attention(
         cpu_out = torch.tensor(y)
         return trans_bnsd_to_tnd(cpu_out, cpu_out.shape, actual_seq_lengths_query)
     return np.transpose(y, axes=(0, 2, 1, 3))
+
+
+#######################################################################################################################################
+
+
+#!/usr/bin/env bash
+# =============================================================================
+# run_sinkhorn_msprof.sh
+#
+# 功能：用 msprof 执行 sinkhorn 测试用例，并从 op_summary 表格中统计
+#       sinkhorn_fwd / sinkhorn_bwd 的性能指标，输出 CSV 与 Markdown 表格。
+#
+# 用法：
+#   bash run_sinkhorn_msprof.sh            # 完整流程：执行 msprof + 统计
+#   REUSE_PROFILE=1 bash run_sinkhorn_msprof.sh   # 跳过 msprof，仅统计已有数据
+#
+# 可配置环境变量：
+#   TEST_FILE     待测文件（默认 tests/mhc/test_sinkhorn.py）
+#   OUTPUT_DIR    msprof 输出目录（默认 /data/g00559402/msprof_sinkhorn_gzh）
+#   DEVICE_ID     NPU 设备号（默认 2）
+#   OP_KEY        op 名称过滤关键字（默认 sinkhorn）
+#   PARAM_ORDER   nodeid 内参数顺序，空格分隔（默认 "mhc n1 n0"）
+# =============================================================================
+set -euo pipefail
+
+TEST_FILE="${TEST_FILE:-tests/mhc/test_sinkhorn.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/g00559402/msprof_sinkhorn_gzh}"
+DEVICE_ID="${DEVICE_ID:-2}"
+OP_KEY="${OP_KEY:-sinkhorn}"
+PARAM_ORDER="${PARAM_ORDER:-mhc n1 n0}"
+
+# ---- 环境准备 -------------------------------------------------------------
+source /data/g00559402/miniconda3/etc/profile.d/conda.sh
+conda activate tl_py310
+source /data/g00559402/pto_prerun_gzh.sh
+export ASCEND_RT_VISIBLE_DEVICES="$DEVICE_ID"
+cd /data/g00559402/TileKernels-Nightly
+
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# ---- 1. 收集用例执行顺序 -------------------------------------------------
+echo "[1/4] collect test cases ..."
+python -m pytest "$TEST_FILE" --collect-only -q 2>/dev/null \
+    | grep -E '::.*\[' > "$WORK_DIR/collect.txt"
+echo "      用例数: $(wc -l < "$WORK_DIR/collect.txt")"
+
+# ---- 2. msprof 执行 --------------------------------------------------------
+if [ "${REUSE_PROFILE:-0}" = "1" ] && [ -d "$OUTPUT_DIR" ]; then
+    echo "[2/4] REUSE_PROFILE=1，跳过 msprof 执行"
+else
+    echo "[2/4] run msprof ..."
+    rm -rf "$OUTPUT_DIR"
+    msprof --output="$OUTPUT_DIR" \
+        --application="python -m pytest $TEST_FILE -q --no-header"
+fi
+
+# ---- 3. 定位 op_summary ----------------------------------------------------
+echo "[3/4] locate op_summary ..."
+OP_SUMMARY="$(find "$OUTPUT_DIR" -name 'op_summary*.csv' | head -1)"
+if [ -z "$OP_SUMMARY" ]; then
+    echo "错误: 未找到 op_summary csv" >&2
+    exit 1
+fi
+echo "      -> $OP_SUMMARY"
+
+# ---- 4. 解析 + 统计 --------------------------------------------------------
+echo "[4/4] parse & summarize ..."
+RESULT_CSV="$OUTPUT_DIR/sinkhorn_op_summary.csv"
+RESULT_MD="$OUTPUT_DIR/sinkhorn_op_summary.md"
+python3 - "$OP_SUMMARY" "$WORK_DIR/collect.txt" "$OP_KEY" "$PARAM_ORDER" "$RESULT_CSV" "$RESULT_MD" << 'PYEOF'
+import csv
+import re
+import sys
+
+op_summary, collect_file, op_key, param_order, result_csv, result_md = sys.argv[1:7]
+param_order = param_order.split()
+
+# msprof op_summary 标准列
+METRICS = [
+    "Task Duration(us)", "aiv_time(us)", "aiv_vec_time(us)", "aiv_vec_ratio",
+    "aiv_scalar_time(us)", "aiv_mte2_time(us)", "aiv_mte3_time(us)",
+]
+
+
+def cast(v):
+    try:
+        return int(v)
+    except ValueError:
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
+
+# 1) 从 collect 输出解析用例参数（按执行顺序）
+cases = []
+with open(collect_file) as f:
+    for line in f:
+        m = re.search(r"\[([^\]]+)\]$", line.strip())
+        if not m:
+            continue
+        vals = [cast(v) for v in m.group(1).split("-")]
+        if len(vals) != len(param_order):
+            continue
+        cases.append(dict(zip(param_order, vals)))
+
+# 2) 读取 op_summary，过滤目标 op，按 Task Start Time 排序
+rows = []
+with open(op_summary) as f:
+    for row in csv.DictReader(f):
+        if op_key in row["Op Name"].lower():
+            rows.append(row)
+rows.sort(key=lambda r: float(r["Task Start Time(us)"]))
+
+# 3) 按 fwd/bwd 配对（每个用例执行顺序为 fwd -> bwd）
+pairs = []
+cur_fwd = None
+for row in rows:
+    name = row["Op Name"]
+    if "fwd" in name:
+        cur_fwd = row
+    elif "bwd" in name:
+        pairs.append((cur_fwd, row))
+        cur_fwd = None
+
+if len(pairs) != len(cases):
+    print(f"WARN: fwd/bwd 配对 {len(pairs)} != 用例数 {len(cases)}", file=sys.stderr)
+
+# 4) 组装结果
+out_rows = []
+for case, (fwd, bwd) in zip(cases, pairs):
+    for d, r in (("fwd", fwd), ("bwd", bwd)):
+        if r is None:
+            continue
+        out_rows.append({**case, "dir": d, **{m: r.get(m, "") for m in METRICS}})
+
+cols = list(param_order) + ["dir"] + METRICS
+
+# 5) 写 CSV
+with open(result_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=cols)
+    w.writeheader()
+    for r in out_rows:
+        w.writerow({c: r.get(c, "") for c in cols})
+
+# 6) 写 Markdown 表格
+with open(result_md, "w") as f:
+    f.write("| " + " | ".join(cols) + " |\n")
+    f.write("|" + "|".join(["---"] * len(cols)) + "|\n")
+    for r in out_rows:
+        f.write("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |\n")
+
+# 7) 打印到 stdout
+print("\n=== sinkhorn op_summary 统计 ===")
+print(" | ".join(cols))
+print(" | ".join(["-" * 8] * len(cols)))
+for r in out_rows:
+    print(" | ".join(str(r.get(c, "")) for c in cols))
+print(f"\n已保存 CSV: {result_csv}")
+print(f"已保存 MD : {result_md}")
+PYEOF
+
+echo "完成。"
